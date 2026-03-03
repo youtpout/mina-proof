@@ -18,8 +18,8 @@
     "buildw": "tsc --watch",
     "coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
     "format": "prettier --write --ignore-unknown **/*",
-    "test": "npm run build && find build/src -name '*.test.js' -exec node --test {} \\;",
-    "testw": "npm run build && find build/src -name '*.test.js' -exec node --test --watch {} \\;",
+    "test": "npm run build && node --test \"build/src/**/*.test.js\"",
+    "testw": "npm run build && node --test --watch \"build/src/**/*.test.js\"",
     "lint": "npx eslint src/* --fix",
     "clear-cache": "npx rimraf cache/* !cache/README.md && npx rimraf cache.json && echo \"Cache cleared successfully!\""
   },
@@ -36,9 +36,12 @@
     "typescript": "^5.4.5"
   },
   "peerDependencies": {
-    "o1js": "^2.*"
+    "o1js": "^2.10.0-dev.be63f"
   },
   "engines": {
     "node": ">=18.14.0"
+  },
+  "dependencies": {
+    "@o1js/native": "^0.0.1-dev.be63f"
   }
 }

@@ -5,7 +5,7 @@ import { describe, it, before, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { writeFileSync, mkdirSync } from 'fs';
 import { join } from 'path';
-
+import { setBackend } from 'o1js';
 
 /*
  * This file specifies how to test the `Add` example smart contract. It is safe to delete this file and replace
@@ -15,6 +15,9 @@ import { join } from 'path';
  */
 
 const proofsEnabled = true;
+
+// native prover
+setBackend('native');
 
 describe('Add', () => {
   let deployerAccount: Mina.TestPublicKey,
