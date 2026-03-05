@@ -40,7 +40,6 @@ describe('Add', () => {
     if (proofsEnabled) {
       let { verificationKey } = await Add.compile();
       vk = verificationKey;
-      console.log('Verification key', vk);
     }
   });
 
@@ -90,7 +89,9 @@ describe('Add', () => {
     const init = await AddZkProgram.init(initialState);
     const update = await AddZkProgram.update(initialState, init.proof);
 
-    console.log('proof', update.proof.toJSON());
+    update.proof.verify();
+    assert(update.proof.publicInput.equals(initialState).toBoolean());
+    assert(update.proof.publicOutput.equals(Field(1)).toBoolean());
 
     const outputDir = join(process.cwd(), 'build', 'proofs');
     mkdirSync(outputDir, { recursive: true });
