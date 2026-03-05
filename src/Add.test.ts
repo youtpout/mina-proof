@@ -38,7 +38,8 @@ describe('Add', () => {
       hash: Field(0),
     };
     if (proofsEnabled) {
-      let { verificationKey: vk } = await Add.compile();
+      let { verificationKey } = await Add.compile();
+      vk = verificationKey;
       console.log('Verification key', vk);
     }
   });
@@ -79,15 +80,26 @@ describe('Add', () => {
 
     const { proof } = await AddZkProgram.init(Field(1));
 
-    console.log('proof', proof.toJSON());
+    assert.deepStrictEqual(proof.publicOutput, Field(1));
+  });
+
+  it('correctly settles `AddZKprogram` state on the `Add` smart contract', async () => {
+    await localDeploy();
+    const initialState = zkApp.num.get();
+
+    const init = await AddZkProgram.init(initialState);
+    const update = await AddZkProgram.update(initialState, init.proof);
+
+    console.log('proof', update.proof.toJSON());
 
     const outputDir = join(process.cwd(), 'build', 'proofs');
     mkdirSync(outputDir, { recursive: true });
 
     const proofPath = join(outputDir, 'proof.json');
     const metaPath = join(outputDir, 'proof.meta.json');
+    const txnPath = join(outputDir, 'txn.json');
 
-    const proofJson = proof.toJSON();
+    const proofJson = update.proof.toJSON();
     writeFileSync(proofPath, JSON.stringify(proofJson, null, 2));
 
     const metadata = {
@@ -102,22 +114,15 @@ describe('Add', () => {
 
     writeFileSync(metaPath, JSON.stringify(metadata, null, 2));
 
-    assert.deepStrictEqual(proof.publicOutput, Field(1));
-  });
-
-  it('correctly settles `AddZKprogram` state on the `Add` smart contract', async () => {
-    await localDeploy();
-    const initialState = zkApp.num.get();
-
-    const init = await AddZkProgram.init(initialState);
-    const update = await AddZkProgram.update(initialState, init.proof);
-
     // settleState transaction
     const txn = await Mina.transaction(senderAccount, async () => {
       await zkApp.settleState(update.proof);
     });
     await txn.prove();
     await txn.sign([senderKey]).send();
+
+
+    writeFileSync(txnPath, txn.toJSON());
 
     const updatedNum = zkApp.num.get();
     assert.deepStrictEqual(updatedNum, Field(1));
