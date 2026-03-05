@@ -98,6 +98,7 @@ describe('Add', () => {
     const proofPath = join(outputDir, 'proof.json');
     const metaPath = join(outputDir, 'proof.meta.json');
     const txnPath = join(outputDir, 'txn.json');
+    const graphqlPath = join(outputDir, 'graphql.txt');
 
     const proofJson = update.proof.toJSON();
     writeFileSync(proofPath, JSON.stringify(proofJson, null, 2));
@@ -123,6 +124,7 @@ describe('Add', () => {
 
 
     writeFileSync(txnPath, txn.toJSON());
+    writeFileSync(graphqlPath, txn.toGraphqlQuery());
 
     const updatedNum = zkApp.num.get();
     assert.deepStrictEqual(updatedNum, Field(1));
