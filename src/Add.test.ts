@@ -95,25 +95,8 @@ describe('Add', () => {
     const outputDir = join(process.cwd(), 'build', 'proofs');
     mkdirSync(outputDir, { recursive: true });
 
-    const proofPath = join(outputDir, 'proof.json');
-    const metaPath = join(outputDir, 'proof.meta.json');
-    const txnPath = join(outputDir, 'txn.json');
     const graphqlPath = join(outputDir, 'graphql.txt');
-
-    const proofJson = update.proof.toJSON();
-    writeFileSync(proofPath, JSON.stringify(proofJson, null, 2));
-
-    const metadata = {
-      timestamp: new Date().toISOString(),
-      verificationKey: vk?.data,
-      publicInput: proofJson.publicInput,
-      publicOutput: proofJson.publicOutput,
-      maxProofsVerified: proofJson.maxProofsVerified,
-      verified: true,
-      program: 'simple-proof',
-    };
-
-    writeFileSync(metaPath, JSON.stringify(metadata, null, 2));
+    const vkPath = join(outputDir, 'vk.txt');
 
     // settleState transaction
     const txn = await Mina.transaction(senderAccount, async () => {
@@ -122,9 +105,9 @@ describe('Add', () => {
     await txn.prove();
     await txn.sign([senderKey]).send();
 
-
-    writeFileSync(txnPath, txn.toJSON());
     writeFileSync(graphqlPath, txn.toGraphqlQuery());
+    writeFileSync(vkPath, vk.data.toString());
+
 
     const updatedNum = zkApp.num.get();
     assert.deepStrictEqual(updatedNum, Field(1));
