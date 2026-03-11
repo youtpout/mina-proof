@@ -1,17 +1,20 @@
 /**
  * BenchHash.ts
  *
- * Benchmark 4 ZK programs with different hash functions in o1js:
- *   1. Poseidon    — native Mina/Pasta field hash
- *   2. SHA2-256    — Hash.SHA2_256
- *   3. Keccak256   — Hash.Keccak256
- *   4. Blake2b     — Hash.BLAKE2B
+ * Benchmark 4 ZK programs using different hash functions in o1js:
+ *   1. Poseidon   — native Mina/Pasta field hash
+ *   2. SHA2-256   — Hash.SHA2_256
+ *   3. Keccak256  — Hash.Keccak256
+ *   4. Blake2b    — Hash.BLAKE2B
  *
- * Each program hashes 4 field elements / bytes and logs:
- *   - constraint count
- *   - compile time
- *   - prove time
- *   - verify time
+ * Each program receives 5 Field elements via Provable.Array(Field, 5).
+ * The byte-based programs convert each Field to 31 bytes in-circuit.
+ *
+ * Iterative hashing pattern (same for all 4 programs):
+ *   state = hash(elem[0])
+ *   state = hash(state || elem[1])
+ *   state = hash(state || elem[2])
+ *   ...
  *
  * Run:
  *   npx ts-node src/BenchHash.ts
@@ -25,63 +28,73 @@ import {
     Hash,
     Bytes,
     UInt8,
+    Bool,
 } from "o1js";
 
+const INPUT_SIZE = 3;
+
 // ---------------------------------------------------------------------------
-// Shared inputs
+// Field → 31 bytes (248 bits, safe for Pasta ~254-bit field)
+// Used inside ZkPrograms to convert each Field element to bytes in-circuit
 // ---------------------------------------------------------------------------
 
-// 4 field elements used by Poseidon
-const FIELDS: Field[] = [Field(1), Field(2), Field(3), Field(4)];
+// Bytes types for the iterative steps:
+//   - first step  : 31 bytes (one field element)
+//   - later steps : 31 (digest truncated) + 31 (next field) = 62 bytes
+class Bytes31 extends Bytes(31) { }
+class Bytes62 extends Bytes(62) { }
 
-// 32 bytes used by SHA256 / Keccak256 / Blake2b
-// Encode the 4 values as 8-byte chunks packed into 32 bytes
-class Bytes32 extends Bytes(32) { }
+/**
+ * Convert a Field to 31 UInt8 bytes (big-endian, 248-bit).
+ * Safe within the Pasta field (254-bit capacity).
+ */
+function fieldToBytes31(f: Field): UInt8[] {
+    const bits = f.toBits(248); // 31 bytes × 8 bits
+    const result: UInt8[] = [];
+    for (let b = 0; b < 31; b++) {
+        let byte = Field(0);
+        for (let bit = 0; bit < 8; bit++) {
+            // bits are little-endian from toBits()
+            const bitField: Field = (bits[b * 8 + bit] as Bool).toField();
+            byte = byte.add(bitField.mul(Field(1 << bit)));
+        }
+        result.push(UInt8.from(byte));
+    }
+    return result;
+}
 
-function makeBytes32(): Bytes32 {
-    const raw: UInt8[] = Array.from({ length: 32 }, (_, i) =>
-        UInt8.from(i + 1)
-    );
-    return Bytes32.from(raw);
+/**
+ * Take the first 31 bytes of a digest (drop last byte to fit Bytes31).
+ */
+function digestTo31(digest: Bytes): UInt8[] {
+    return digest.bytes.slice(0, 31);
 }
 
 // ---------------------------------------------------------------------------
-// Logging helpers
-// ---------------------------------------------------------------------------
-
-function separator(title: string) {
-    console.log("\n" + "─".repeat(62));
-    console.log(`  ${title}`);
-    console.log("─".repeat(62));
-}
-
-// ---------------------------------------------------------------------------
-// 1. Poseidon — native Mina hash over Field[]
+// 1. Poseidon — iterative fold over Field[]
 // ---------------------------------------------------------------------------
 
 const PoseidonProgram = ZkProgram({
     name: "PoseidonBench",
-    publicInput: Field, // dummy public input to satisfy the API
+    publicInput: Field, // dummy
     methods: {
         hash: {
-            privateInputs: [Field, Field, Field, Field],
-            async method(
-                _pub: Field,
-                a: Field,
-                b: Field,
-                c: Field,
-                d: Field
-            ): Promise<void> {
-                const result = Poseidon.hash([a, b, c, d]);
-                // Constrain result so the compiler can't eliminate the computation
-                result.assertNotEquals(Field(-1));
+            privateInputs: [Provable.Array(Field, INPUT_SIZE)],
+            async method(_pub: Field, inputs: Field[]): Promise<void> {
+                // state = Poseidon(elem[0])
+                let state = Poseidon.hash([inputs[0]]);
+                // state = Poseidon(state, elem[i])  for i = 1..N-1
+                for (let i = 1; i < INPUT_SIZE; i++) {
+                    state = Poseidon.hash([state, inputs[i]]);
+                }
+                state.assertNotEquals(Field(-1));
             },
         },
     },
 });
 
 // ---------------------------------------------------------------------------
-// 2. SHA2-256 — Hash.SHA2_256 over Bytes32
+// 2. SHA2-256 — iterative, converting each Field to 31 bytes in-circuit
 // ---------------------------------------------------------------------------
 
 const Sha256Program = ZkProgram({
@@ -89,10 +102,20 @@ const Sha256Program = ZkProgram({
     publicInput: Field,
     methods: {
         hash: {
-            privateInputs: [Bytes32],
-            async method(_pub: Field, input: Bytes32): Promise<void> {
-                const digest = Hash.SHA2_256.hash(input);
-                // Constrain first byte so computation is not eliminated
+            privateInputs: [Provable.Array(Field, INPUT_SIZE)],
+            async method(_pub: Field, inputs: Field[]): Promise<void> {
+                // First step: hash(elem[0])  →  Bytes31 input
+                const first = Bytes31.from(fieldToBytes31(inputs[0]));
+                let digest = Hash.SHA2_256.hash(first);
+
+                // Next steps: hash(digest[0..30] || elem[i])  →  Bytes62 input
+                for (let i = 1; i < INPUT_SIZE; i++) {
+                    const combined = Bytes62.from([
+                        ...digestTo31(digest),
+                        ...fieldToBytes31(inputs[i]),
+                    ]);
+                    digest = Hash.SHA2_256.hash(combined);
+                }
                 digest.bytes[0].value.assertNotEquals(Field(-1));
             },
         },
@@ -100,7 +123,7 @@ const Sha256Program = ZkProgram({
 });
 
 // ---------------------------------------------------------------------------
-// 3. Keccak256 — Hash.Keccak256 over Bytes32
+// 3. Keccak256 — same structure as SHA256
 // ---------------------------------------------------------------------------
 
 const Keccak256Program = ZkProgram({
@@ -108,9 +131,18 @@ const Keccak256Program = ZkProgram({
     publicInput: Field,
     methods: {
         hash: {
-            privateInputs: [Bytes32],
-            async method(_pub: Field, input: Bytes32): Promise<void> {
-                const digest = Hash.Keccak256.hash(input);
+            privateInputs: [Provable.Array(Field, INPUT_SIZE)],
+            async method(_pub: Field, inputs: Field[]): Promise<void> {
+                const first = Bytes31.from(fieldToBytes31(inputs[0]));
+                let digest = Hash.Keccak256.hash(first);
+
+                for (let i = 1; i < INPUT_SIZE; i++) {
+                    const combined = Bytes62.from([
+                        ...digestTo31(digest),
+                        ...fieldToBytes31(inputs[i]),
+                    ]);
+                    digest = Hash.Keccak256.hash(combined);
+                }
                 digest.bytes[0].value.assertNotEquals(Field(-1));
             },
         },
@@ -118,7 +150,7 @@ const Keccak256Program = ZkProgram({
 });
 
 // ---------------------------------------------------------------------------
-// 4. Blake2b — Hash.BLAKE2B over Bytes32
+// 4. Blake2b — same structure
 // ---------------------------------------------------------------------------
 
 const Blake2bProgram = ZkProgram({
@@ -126,9 +158,18 @@ const Blake2bProgram = ZkProgram({
     publicInput: Field,
     methods: {
         hash: {
-            privateInputs: [Bytes32],
-            async method(_pub: Field, input: Bytes32): Promise<void> {
-                const digest = Hash.BLAKE2B.hash(input);
+            privateInputs: [Provable.Array(Field, INPUT_SIZE)],
+            async method(_pub: Field, inputs: Field[]): Promise<void> {
+                const first = Bytes31.from(fieldToBytes31(inputs[0]));
+                let digest = Hash.BLAKE2B.hash(first);
+
+                for (let i = 1; i < INPUT_SIZE; i++) {
+                    const combined = Bytes62.from([
+                        ...digestTo31(digest),
+                        ...fieldToBytes31(inputs[i]),
+                    ]);
+                    digest = Hash.BLAKE2B.hash(combined);
+                }
                 digest.bytes[0].value.assertNotEquals(Field(-1));
             },
         },
@@ -136,7 +177,7 @@ const Blake2bProgram = ZkProgram({
 });
 
 // ---------------------------------------------------------------------------
-// Benchmark runner
+// Benchmark helpers
 // ---------------------------------------------------------------------------
 
 interface BenchResult {
@@ -146,6 +187,12 @@ interface BenchResult {
     proveMs: number;
     verifyMs: number;
     totalMs: number;
+}
+
+function separator(title: string) {
+    console.log("\n" + "─".repeat(62));
+    console.log(`  ${title}`);
+    console.log("─".repeat(62));
 }
 
 async function runBench<P extends {
@@ -160,24 +207,20 @@ async function runBench<P extends {
 ): Promise<BenchResult> {
     separator(`Benchmarking: ${name}`);
 
-    // Constraint count
     const analysis = await program.analyzeMethods();
     const constraints = (analysis[methodName] as { rows: number }).rows;
     console.log(`  Constraints : ${constraints.toLocaleString()}`);
 
-    // Compile
     const t0 = performance.now();
     await program.compile();
     const compileMs = Math.round(performance.now() - t0);
     console.log(`  Compile     : ${compileMs} ms`);
 
-    // Prove
     const t1 = performance.now();
     const { proof } = await prove();
     const proveMs = Math.round(performance.now() - t1);
     console.log(`  Prove       : ${proveMs} ms`);
 
-    // Verify
     const t2 = performance.now();
     const ok = await program.verify(proof);
     const verifyMs = Math.round(performance.now() - t2);
@@ -195,51 +238,46 @@ async function runBench<P extends {
 
 async function main() {
     console.log("\n╔════════════════════════════════════════════════════════════╗");
-    console.log("║  o1js Hash Benchmark — 4 inputs per program               ║");
+    console.log(`║  o1js Hash Benchmark — ${INPUT_SIZE} inputs, iterative fold          ║`);
     console.log("║  Poseidon  /  SHA2-256  /  Keccak256  /  Blake2b          ║");
     console.log("╚════════════════════════════════════════════════════════════╝");
 
-    const bytes = makeBytes32();
+    // 5 deterministic field elements: Field(1) .. Field(5)
+    const inputs: Field[] = Array.from({ length: INPUT_SIZE }, (_, i) =>
+        Field(i + 1)
+    );
     const pub = Field(0); // dummy public input
 
     const results: BenchResult[] = [];
 
-    // 1. Poseidon
     results.push(
         await runBench(
-            PoseidonProgram,
-            "hash",
-            () => PoseidonProgram.hash(pub, FIELDS[0], FIELDS[1], FIELDS[2], FIELDS[3]),
+            PoseidonProgram, "hash",
+            () => PoseidonProgram.hash(pub, inputs),
             "Poseidon (native)"
         )
     );
 
-    // 2. SHA2-256
     results.push(
         await runBench(
-            Sha256Program,
-            "hash",
-            () => Sha256Program.hash(pub, bytes),
+            Sha256Program, "hash",
+            () => Sha256Program.hash(pub, inputs),
             "SHA2-256"
         )
     );
 
-    // 3. Keccak256
     results.push(
         await runBench(
-            Keccak256Program,
-            "hash",
-            () => Keccak256Program.hash(pub, bytes),
+            Keccak256Program, "hash",
+            () => Keccak256Program.hash(pub, inputs),
             "Keccak256"
         )
     );
 
-    // 4. Blake2b
     results.push(
         await runBench(
-            Blake2bProgram,
-            "hash",
-            () => Blake2bProgram.hash(pub, bytes),
+            Blake2bProgram, "hash",
+            () => Blake2bProgram.hash(pub, inputs),
             "Blake2b"
         )
     );
@@ -254,28 +292,28 @@ async function main() {
         p("Hash", 20) +
         r("Rows", 10) +
         r("Compile(ms)", 14) +
-        r("Prove(ms)", 14) +
+        r("Prove(ms)", 16) +
         r("Verify(ms)", 13) +
         r("Total(ms)", 12)
     );
-    console.log("─".repeat(83));
+    console.log("─".repeat(85));
 
     const baseline = results[0].proveMs || 1;
-
     for (const res of results) {
         const mult = (res.proveMs / baseline).toFixed(1);
         console.log(
             p(res.name, 20) +
             r(res.constraints.toLocaleString(), 10) +
             r(res.compileMs.toString(), 14) +
-            r(`${res.proveMs} (${mult}×)`, 14) +
+            r(`${res.proveMs} (${mult}×)`, 16) +
             r(res.verifyMs.toString(), 13) +
             r(res.totalMs.toString(), 12)
         );
     }
 
-    console.log("\n  Prove time ratio relative to Poseidon (baseline = 1×)");
-    console.log("  Rows = circuit rows (constraints) reported by analyzeMethods\n");
+    console.log(`\n  ${INPUT_SIZE} inputs per program, iterative: state = hash(state || elem[i])`);
+    console.log("  Rows = circuit rows reported by analyzeMethods()");
+    console.log("  Prove ratio relative to Poseidon baseline (1×)\n");
 }
 
 main().catch((e) => {
