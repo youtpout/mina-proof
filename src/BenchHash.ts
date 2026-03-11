@@ -277,10 +277,13 @@ async function runBench<P extends {
     separator(`Benchmarking: ${name}`);
 
     const analysis = await program.analyzeMethods();
+    const analysisAny = analysis as unknown as any;
+    const gates = analysisAny?.base?.gates?.length || 0;
     const rowsBase = (analysis["base"] as { rows: number }).rows;
     const rowsStep = (analysis["step"] as { rows: number }).rows;
     console.log(`  Rows (base) : ${rowsBase.toLocaleString()}`);
     console.log(`  Rows (step) : ${rowsStep.toLocaleString()}`);
+    console.log(`  Gates (base): ${gates.toLocaleString()}`);
 
     const t0 = performance.now();
     await program.compile();
