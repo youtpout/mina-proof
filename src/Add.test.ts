@@ -1,4 +1,4 @@
-import { AccountUpdate, Field, Mina, PrivateKey, PublicKey, VerificationKey } from 'o1js';
+import { AccountUpdate, Field, Mina, PrivateKey, Proof, PublicKey, VerificationKey, ZkProgram } from 'o1js';
 import { Add } from './Add.js';
 import { AddZkProgram } from './AddZkProgram.js';
 import { describe, it, before, beforeEach } from 'node:test';
@@ -38,8 +38,8 @@ describe('Add', () => {
       hash: Field(0),
     };
     if (proofsEnabled) {
-      let { verificationKey: vk } = await Add.compile();
-      console.log('Verification key', vk);
+      let { verificationKey } = await Add.compile();
+      vk = verificationKey;
     }
   });
 
@@ -79,29 +79,6 @@ describe('Add', () => {
 
     const { proof } = await AddZkProgram.init(Field(1));
 
-    console.log('proof', proof.toJSON());
-
-    const outputDir = join(process.cwd(), 'build', 'proofs');
-    mkdirSync(outputDir, { recursive: true });
-
-    const proofPath = join(outputDir, 'proof.json');
-    const metaPath = join(outputDir, 'proof.meta.json');
-
-    const proofJson = proof.toJSON();
-    writeFileSync(proofPath, JSON.stringify(proofJson, null, 2));
-
-    const metadata = {
-      timestamp: new Date().toISOString(),
-      verificationKey: vk?.data,
-      publicInput: proofJson.publicInput,
-      publicOutput: proofJson.publicOutput,
-      maxProofsVerified: proofJson.maxProofsVerified,
-      verified: true,
-      program: 'simple-proof',
-    };
-
-    writeFileSync(metaPath, JSON.stringify(metadata, null, 2));
-
     assert.deepStrictEqual(proof.publicOutput, Field(1));
   });
 
@@ -112,12 +89,27 @@ describe('Add', () => {
     const init = await AddZkProgram.init(initialState);
     const update = await AddZkProgram.update(initialState, init.proof);
 
+    update.proof.verify();
+    assert(update.proof.publicInput.equals(initialState).toBoolean());
+    assert(update.proof.publicOutput.equals(Field(1)).toBoolean());
+
+    const outputDir = join(process.cwd(), 'build', 'proofs');
+    mkdirSync(outputDir, { recursive: true });
+
+    const graphqlPath = join(outputDir, 'graphql.txt');
+    const vkPath = join(outputDir, 'vk.txt');
+    const proofPath = join(outputDir, 'proof.json');
+
     // settleState transaction
     const txn = await Mina.transaction(senderAccount, async () => {
       await zkApp.settleState(update.proof);
     });
     await txn.prove();
     await txn.sign([senderKey]).send();
+
+    writeFileSync(graphqlPath, txn.toGraphqlQuery());
+    writeFileSync(vkPath, vk.data.toString());
+    writeFileSync(proofPath, JSON.stringify(update.proof.toJSON(), null, 2));
 
     const updatedNum = zkApp.num.get();
     assert.deepStrictEqual(updatedNum, Field(1));
