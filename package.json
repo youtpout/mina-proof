@@ -16,6 +16,7 @@
   "scripts": {
     "build": "tsc",
     "buildw": "tsc --watch",
+    "bench": "npx ts-node src/BenchHash.ts",
     "coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
     "format": "prettier --write --ignore-unknown **/*",
     "test": "npm run build && node --test \"build/src/**/*.test.js\"",
