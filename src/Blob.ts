@@ -10,12 +10,7 @@ import {
 } from 'o1js';
 
 import cKzg from 'c-kzg';
-
-import type {
-    Blob,
-    Bytes32,
-    Bytes48,
-} from 'c-kzg';
+import type { Blob, Bytes32, Bytes48 } from 'c-kzg';
 
 import { createHash } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
@@ -43,11 +38,10 @@ const {
 const BLS_MODULUS =
     52435875175126190479447740508185965837690552500527637822603658699938581184513n;
 
-
 const LOG2_BLOB_SIZE = 12;
 const PRIMITIVE_ROOT_OF_UNITY = 7n;
 
-
+const BYTES_PER_FIELD = 32;
 const CHUNK_SIZE = 256;
 const NUM_CHUNKS = FIELD_ELEMENTS_PER_BLOB / CHUNK_SIZE;
 
@@ -294,9 +288,7 @@ function loadBlobJson(): BlobJson {
     const parsed = JSON.parse(raw) as Partial<BlobJson>;
 
     if (!parsed.blobHex || !parsed.commitmentHex || !parsed.proofHex) {
-        throw new Error(
-            'blob.json must contain blobHex, commitmentHex, and proofHex'
-        );
+        throw new Error('blob.json must contain blobHex, commitmentHex, and proofHex');
     }
 
     return {
@@ -346,16 +338,27 @@ function loadBlobscanCase() {
     const commitmentMatches = equalBytes(computedCommitmentBytes, commitmentBytes);
 
     const proofVerifies = verifyBlobKzgProof(blob, commitment, proof);
-    const proofBatchVerifies = verifyBlobKzgProofBatch(
-        [blob],
-        [commitment],
-        [proof]
-    );
+    const proofBatchVerifies = verifyBlobKzgProofBatch([blob], [commitment], [proof]);
 
     const computedBlobProofBytes = Uint8Array.from(
         computeBlobKzgProof(blob, commitment)
     );
     const blobProofMatches = equalBytes(computedBlobProofBytes, proofBytes);
+
+    const zBytes = bigintToBytesBE(zBigint, BYTES_PER_FIELD) as Bytes32;
+    const [proofAtZRaw, yBytesRaw] = computeKzgProof(blob, zBytes);
+    const proofAtZBytes = Uint8Array.from(proofAtZRaw);
+    const yBytes = Uint8Array.from(yBytesRaw);
+    const yFromCkzgBigint = bytesToBigintBE(yBytes);
+
+    const verifyAtZ = verifyKzgProof(
+        commitment,
+        zBytes,
+        yBytes as Bytes32,
+        proofAtZBytes as Bytes48
+    );
+
+    const yMatchesCkzg = yFromCkzgBigint === yBigint;
 
     const commitmentTagBytes = sha256Bytes(commitmentBytes).slice(0, 31);
     const CBigint = bytesToBigintBE(commitmentTagBytes);
@@ -374,6 +377,12 @@ function loadBlobscanCase() {
         proofBatchVerifies,
         computedBlobProofBytes,
         blobProofMatches,
+        zBytes,
+        proofAtZBytes,
+        yBytes,
+        yFromCkzgBigint,
+        yMatchesCkzg,
+        verifyAtZ,
     };
 }
 
@@ -581,10 +590,7 @@ async function proveTree(
         const nextLevel: BlobEvalProof[] = [];
 
         for (let i = 0; i < level.length; i += 2) {
-            const { proof } = await BlobEvalProgram.merge(
-                level[i],
-                level[i + 1]
-            );
+            const { proof } = await BlobEvalProgram.merge(level[i], level[i + 1]);
 
             nextLevel.push(proof as BlobEvalProof);
             console.log(`    merge ${i / 2 + 1}/${level.length / 2} done`);
@@ -627,72 +633,80 @@ async function main() {
 
     loadTrustedSetup(0, TRUSTED_SETUP_PATH);
 
-    try {
-        console.time('load-blobscan-input');
-        const input = loadBlobscanCase();
-        console.timeEnd('load-blobscan-input');
+    console.time('load-blobscan-input');
+    const input = loadBlobscanCase();
+    console.timeEnd('load-blobscan-input');
 
-        console.log('\n=== Blobscan / c-kzg checks ===');
-        console.log('blob bytes length        :', input.blobBytes.length);
-        console.log('commitment bytes length  :', input.commitmentBytes.length);
-        console.log('proof bytes length       :', input.proofBytes.length);
-        console.log('commitment matches       :', input.commitmentMatches);
-        console.log('blob proof verifies      :', input.proofVerifies);
-        console.log('batch proof verifies     :', input.proofBatchVerifies);
-        console.log('blob proof matches       :', input.blobProofMatches);
-        console.log('computed commitment hex  :', bytesToHex(input.computedCommitmentBytes));
-        console.log('input commitment hex     :', bytesToHex(input.commitmentBytes));
-        console.log('computed proof hex       :', bytesToHex(input.computedBlobProofBytes));
-        console.log('input proof hex          :', bytesToHex(input.proofBytes));
-        console.log('z (manual deneb)         :', input.zBigint.toString());
-        console.log('y (manual deneb)         :', input.yBigint.toString());
+    console.log('\n=== Blobscan / c-kzg checks ===');
+    console.log('blob bytes length        :', input.blobBytes.length);
+    console.log('commitment bytes length  :', input.commitmentBytes.length);
+    console.log('proof bytes length       :', input.proofBytes.length);
+    console.log('commitment matches       :', input.commitmentMatches);
+    console.log('blob proof verifies      :', input.proofVerifies);
+    console.log('batch proof verifies     :', input.proofBatchVerifies);
+    console.log('blob proof matches       :', input.blobProofMatches);
+    console.log('verify at z              :', input.verifyAtZ);
+    console.log('y matches c-kzg          :', input.yMatchesCkzg);
+    console.log('computed commitment hex  :', bytesToHex(input.computedCommitmentBytes));
+    console.log('input commitment hex     :', bytesToHex(input.commitmentBytes));
+    console.log('computed blob proof hex  :', bytesToHex(input.computedBlobProofBytes));
+    console.log('input blob proof hex     :', bytesToHex(input.proofBytes));
+    console.log('proof at z hex           :', bytesToHex(input.proofAtZBytes));
+    console.log('z (manual deneb)         :', input.zBigint.toString());
+    console.log('y (manual deneb)         :', input.yBigint.toString());
+    console.log('y (c-kzg at z)           :', input.yFromCkzgBigint.toString());
 
-        const z = new BlsFrCanonical(input.zBigint);
-        const C = Field(input.CBigint);
+    const z = new BlsFrCanonical(input.zBigint);
+    const C = Field(input.CBigint);
 
-        const blobChunks: BlsFrA[][] = Array.from({ length: NUM_CHUNKS }, (_, k) =>
-            input.blobBigints
-                .slice(k * CHUNK_SIZE, (k + 1) * CHUNK_SIZE)
-                .map((x) => new BlsFrAlmost(x))
-        );
+    const blobChunks: BlsFrA[][] = Array.from({ length: NUM_CHUNKS }, (_, k) =>
+        input.blobBigints
+            .slice(k * CHUNK_SIZE, (k + 1) * CHUNK_SIZE)
+            .map((x) => new BlsFrAlmost(x))
+    );
 
-        const chunkRoots: BlsFrC[][] = CHUNK_ROOTS;
+    const chunkRoots: BlsFrC[][] = CHUNK_ROOTS;
 
-        console.log('\nCompiling...');
-        console.time('compile');
-        const { verificationKey } = await BlobEvalProgram.compile({ cache });
-        console.timeEnd('compile');
+    console.log('\nCompiling...');
+    console.time('compile');
+    const { verificationKey } = await BlobEvalProgram.compile({ cache });
+    console.timeEnd('compile');
 
-        console.log('\nProving...');
-        console.time('prove-total');
-        const proof = await proveTree(blobChunks, chunkRoots, z, C);
-        console.timeEnd('prove-total');
+    console.log('\nProving...');
+    console.time('prove-total');
+    const proof = await proveTree(blobChunks, chunkRoots, z, C);
+    console.timeEnd('prove-total');
 
-        console.log('\nVerifying recursive proof...');
-        console.time('verify');
-        const ok = await verify(proof, verificationKey);
-        console.timeEnd('verify');
+    console.log('\nVerifying recursive proof...');
+    console.time('verify');
+    const ok = await verify(proof, verificationKey);
+    console.timeEnd('verify');
 
-        const output = proof.publicOutput;
-        const yCircuit = output.partialSum.toBigInt();
+    const output = proof.publicOutput;
+    const yCircuit = output.partialSum.toBigInt();
 
-        console.log('\n=== Circuit result ===');
-        console.log('proof verified           :', ok);
-        console.log(
-            'is finalized             :',
-            output.chunksDone.toBigInt() === BigInt(FIELD_ELEMENTS_PER_BLOB + 1)
-        );
-        console.log('z matches manual         :', output.z.toBigInt() === input.zBigint);
-        console.log('C matches tag            :', output.C.toBigInt() === input.CBigint);
-        console.log('y (circuit)              :', yCircuit.toString());
-        console.log('y (manual deneb)         :', input.yBigint.toString());
-        console.log('y circuit == manual      :', yCircuit === input.yBigint);
+    console.log('\n=== Circuit result ===');
+    console.log('proof verified           :', ok);
+    console.log(
+        'is finalized             :',
+        output.chunksDone.toBigInt() === BigInt(FIELD_ELEMENTS_PER_BLOB + 1)
+    );
+    console.log('z matches manual         :', output.z.toBigInt() === input.zBigint);
+    console.log('C matches tag            :', output.C.toBigInt() === input.CBigint);
+    console.log('y (circuit)              :', yCircuit.toString());
+    console.log('y (manual deneb)         :', input.yBigint.toString());
+    console.log('y (c-kzg at z)           :', input.yFromCkzgBigint.toString());
+    console.log('y circuit == manual      :', yCircuit === input.yBigint);
+    console.log('y manual == c-kzg        :', input.yBigint === input.yFromCkzgBigint);
+    console.log('y circuit == c-kzg       :', yCircuit === input.yFromCkzgBigint);
 
-        if (!ok || !input.proofVerifies || !input.commitmentMatches) {
-            process.exitCode = 1;
-        }
-    } finally {
-
+    if (
+        !ok ||
+        !input.commitmentMatches ||
+        !input.verifyAtZ ||
+        !input.yMatchesCkzg
+    ) {
+        process.exitCode = 1;
     }
 }
 
