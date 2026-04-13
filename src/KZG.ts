@@ -300,14 +300,14 @@ async function proveTree(
     const leaves: BlobEvalProof[] = [];
 
     for (let k = 0; k < NUM_CHUNKS; k++) {
-        const proof = (await BlobEvalProgram.leaf(
+        const { proof } = await BlobEvalProgram.leaf(
             z,
             C,
             chunkRoots[k],
             blobChunks[k]
-        )) as BlobEvalProof;
+        );
 
-        leaves.push(proof);
+        leaves.push(proof as BlobEvalProof);
         console.log(`    leaf ${k + 1}/${NUM_CHUNKS} done`);
     }
 
@@ -325,12 +325,12 @@ async function proveTree(
         const nextLevel: BlobEvalProof[] = [];
 
         for (let i = 0; i < level.length; i += 2) {
-            const merged = (await BlobEvalProgram.merge(
+            const { proof } = await BlobEvalProgram.merge(
                 level[i],
                 level[i + 1]
-            )) as BlobEvalProof;
+            );
 
-            nextLevel.push(merged);
+            nextLevel.push(proof as BlobEvalProof);
             console.log(`    merge ${i / 2 + 1}/${level.length / 2} done`);
         }
 
@@ -342,13 +342,11 @@ async function proveTree(
     console.log('  [finalize]...');
     console.time('  finalize');
 
-    const finalProof = (await BlobEvalProgram.finalize(
-        level[0]
-    )) as BlobEvalProof;
+    const { proof } = await BlobEvalProgram.finalize(level[0]);
 
     console.timeEnd('  finalize');
 
-    return finalProof;
+    return proof as BlobEvalProof;
 }
 
 // -----------------------------------------------------------------------------
