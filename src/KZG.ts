@@ -22,7 +22,7 @@ const LOG2_BLOB_SIZE = 12;
 const PRIMITIVE_ROOT_OF_UNITY = 7n;
 
 const CHUNK_SIZE = 256;
-const NUM_CHUNKS = FIELD_ELEMENTS_PER_BLOB / CHUNK_SIZE; // 16
+const NUM_CHUNKS = FIELD_ELEMENTS_PER_BLOB / CHUNK_SIZE;
 
 const cache = Cache.FileSystem('./cache');
 
@@ -39,6 +39,8 @@ type BlsFrC = InstanceType<typeof BlsFrCanonical>;
 type BlsFrU = InstanceType<typeof BlsFr>;
 
 const ChunkArray = Provable.Array(BlsFrAlmost, CHUNK_SIZE);
+const ChunkRootsArray = Provable.Array(BlsFrCanonical, CHUNK_SIZE);
+
 const WIDTH = new BlsFrCanonical(BigInt(FIELD_ELEMENTS_PER_BLOB));
 const ONE = new BlsFrCanonical(1n);
 const CHUNK_SIGNS = Array.from({ length: CHUNK_SIZE - 1 }, () => 1 as const) as (
@@ -89,10 +91,12 @@ function bitReversalPermutation<T>(seq: T[]): T[] {
 function computePowers(x: bigint, n: number): bigint[] {
     const out: bigint[] = [];
     let cur = 1n;
+
     for (let i = 0; i < n; i++) {
         out.push(cur);
         cur = mod(cur * x);
     }
+
     return out;
 }
 
@@ -128,17 +132,17 @@ class BlobEvalOutput extends Struct({
     chunksDone: Field,
 }) { }
 
-type BlobSelfProof = SelfProof<undefined, BlobEvalOutput>;
-
 // -----------------------------------------------------------------------------
 // Circuit helpers
 // -----------------------------------------------------------------------------
 
 function squareRepeatedly(x: BlsFrA | BlsFrC, rounds: number): BlsFrA {
     let acc = x as unknown as BlsFrA;
+
     for (let i = 0; i < rounds; i++) {
         acc = acc.mul(acc).assertAlmostReduced() as BlsFrA;
     }
+
     return acc;
 }
 
@@ -177,7 +181,6 @@ function evalChunk(chunk: BlsFrA[], chunkRoots: BlsFrC[], z: BlsFrC): BlsFrA {
     );
 
     const invs = batchInvert(dens);
-
     const terms = nums.map((n, i) => n.mul(invs[i])) as BlsFrU[];
 
     return BlsFr.sum(terms, CHUNK_SIGNS).assertAlmostReduced() as BlsFrA;
@@ -188,49 +191,44 @@ function evalChunk(chunk: BlsFrA[], chunkRoots: BlsFrC[], z: BlsFrC): BlsFrA {
 // -----------------------------------------------------------------------------
 
 const BlobEvalProgram = ZkProgram({
-    name: 'blob-eval-4096-tree',
+    name: 'blob-eval-4096-tree-single-leaf',
     publicOutput: BlobEvalOutput,
 
-    methods: (() => {
-        const methods: Record<string, any> = {};
+    methods: {
+        leaf: {
+            privateInputs: [BlsFrCanonical, Field, ChunkRootsArray, ChunkArray],
 
-        for (let k = 0; k < NUM_CHUNKS; k++) {
-            const kRoots = CHUNK_ROOTS[k];
+            async method(
+                z: BlsFrC,
+                C: Field,
+                chunkRoots: BlsFrC[],
+                chunk: BlsFrA[]
+            ): Promise<{ publicOutput: BlobEvalOutput }> {
+                const partialSum = evalChunk(chunk, chunkRoots, z);
 
-            methods[`leaf_${k}`] = {
-                privateInputs: [BlsFrCanonical, Field, ChunkArray],
+                return {
+                    publicOutput: new BlobEvalOutput({
+                        z,
+                        C,
+                        partialSum,
+                        chunksDone: Field(CHUNK_SIZE),
+                    }),
+                };
+            },
+        },
 
-                async method(
-                    z: BlsFrC,
-                    C: Field,
-                    chunk: BlsFrA[]
-                ): Promise<{ publicOutput: BlobEvalOutput }> {
-                    const partialSum = evalChunk(chunk, kRoots, z);
-
-                    return {
-                        publicOutput: new BlobEvalOutput({
-                            z,
-                            C,
-                            partialSum,
-                            chunksDone: Field(CHUNK_SIZE),
-                        }),
-                    };
-                },
-            };
-        }
-
-        methods.merge = {
+        merge: {
             privateInputs: [SelfProof, SelfProof] as const,
 
             async method(
-                leftProof: BlobSelfProof,
-                rightProof: BlobSelfProof
+                leftProof: SelfProof<undefined, BlobEvalOutput>,
+                rightProof: SelfProof<undefined, BlobEvalOutput>
             ): Promise<{ publicOutput: BlobEvalOutput }> {
                 leftProof.verify();
                 rightProof.verify();
 
-                const l = leftProof.publicOutput as unknown as BlobEvalOutput;
-                const r = rightProof.publicOutput as unknown as BlobEvalOutput;
+                const l = leftProof.publicOutput;
+                const r = rightProof.publicOutput;
 
                 l.z.assertEquals(r.z, 'merge: z mismatch');
                 l.C.assertEquals(r.C, 'merge: C mismatch');
@@ -250,17 +248,17 @@ const BlobEvalProgram = ZkProgram({
                     }),
                 };
             },
-        };
+        },
 
-        methods.finalize = {
+        finalize: {
             privateInputs: [SelfProof] as const,
 
             async method(
-                rootProof: BlobSelfProof
+                rootProof: SelfProof<undefined, BlobEvalOutput>
             ): Promise<{ publicOutput: BlobEvalOutput }> {
                 rootProof.verify();
 
-                const root = rootProof.publicOutput as unknown as BlobEvalOutput;
+                const root = rootProof.publicOutput;
 
                 root.chunksDone.assertEquals(
                     Field(FIELD_ELEMENTS_PER_BLOB),
@@ -280,57 +278,77 @@ const BlobEvalProgram = ZkProgram({
                     }),
                 };
             },
-        };
-
-        return methods;
-    })(),
+        },
+    },
 });
 
 class BlobEvalProof extends ZkProgram.Proof(BlobEvalProgram) { }
 
-type Prog = typeof BlobEvalProgram & Record<string, (...args: any[]) => Promise<BlobEvalProof>>;
-const prog = BlobEvalProgram as Prog;
-
 // -----------------------------------------------------------------------------
-// Tree proving
+// Prover tree
 // -----------------------------------------------------------------------------
 
 async function proveTree(
     blobChunks: BlsFrA[][],
+    chunkRoots: BlsFrC[][],
     z: BlsFrC,
     C: Field
 ): Promise<BlobEvalProof> {
-    console.log(`  [level 0] proving ${NUM_CHUNKS} leaves in parallel...`);
+    console.log(`  [level 0] proving ${NUM_CHUNKS} leaves sequentially...`);
     console.time('  level-0');
 
-    let level: BlobEvalProof[] = await Promise.all(
-        Array.from({ length: NUM_CHUNKS }, (_, k) => prog[`leaf_${k}`](z, C, blobChunks[k]))
-    );
+    const leaves: BlobEvalProof[] = [];
+
+    for (let k = 0; k < NUM_CHUNKS; k++) {
+        const proof = (await BlobEvalProgram.leaf(
+            z,
+            C,
+            chunkRoots[k],
+            blobChunks[k]
+        )) as BlobEvalProof;
+
+        leaves.push(proof);
+        console.log(`    leaf ${k + 1}/${NUM_CHUNKS} done`);
+    }
 
     console.timeEnd('  level-0');
 
+    let level: BlobEvalProof[] = leaves;
     let depth = 1;
 
     while (level.length > 1) {
-        console.log(`  [level ${depth}] merging ${level.length / 2} pairs in parallel...`);
+        console.log(
+            `  [level ${depth}] merging ${level.length / 2} pairs sequentially...`
+        );
         console.time(`  level-${depth}`);
 
-        level = await Promise.all(
-            Array.from({ length: level.length / 2 }, (_, i) =>
-                BlobEvalProgram.merge(level[2 * i], level[2 * i + 1])
-            )
-        );
+        const nextLevel: BlobEvalProof[] = [];
 
+        for (let i = 0; i < level.length; i += 2) {
+            const merged = (await BlobEvalProgram.merge(
+                level[i],
+                level[i + 1]
+            )) as BlobEvalProof;
+
+            nextLevel.push(merged);
+            console.log(`    merge ${i / 2 + 1}/${level.length / 2} done`);
+        }
+
+        level = nextLevel;
         console.timeEnd(`  level-${depth}`);
         depth++;
     }
 
     console.log('  [finalize]...');
     console.time('  finalize');
-    const final = await BlobEvalProgram.finalize(level[0]);
+
+    const finalProof = (await BlobEvalProgram.finalize(
+        level[0]
+    )) as BlobEvalProof;
+
     console.timeEnd('  finalize');
 
-    return final;
+    return finalProof;
 }
 
 // -----------------------------------------------------------------------------
@@ -375,10 +393,10 @@ function randomChallengeOutsideDomain(): bigint {
 // -----------------------------------------------------------------------------
 
 async function main() {
-    console.log('=== KZG Blob Eval — Binary Tree Recursion ===');
-    console.log(`  leaves     : ${NUM_CHUNKS}  (${CHUNK_SIZE} elements each, all parallel)`);
-    console.log(`  tree depth : ${Math.log2(NUM_CHUNKS)} merge levels`);
-    console.log(`  total steps: ${Math.log2(NUM_CHUNKS) + 2}  (vs ${NUM_CHUNKS} sequential)\n`);
+    console.log('=== KZG Blob Eval — Single Leaf Method ===');
+    console.log(`  methods    : leaf / merge / finalize`);
+    console.log(`  chunks     : ${NUM_CHUNKS}`);
+    console.log(`  chunk size : ${CHUNK_SIZE}\n`);
 
     console.time('generate-test-data');
     const blobBigints = randomBlob();
@@ -396,6 +414,8 @@ async function main() {
             .map((x) => new BlsFrAlmost(x))
     );
 
+    const chunkRoots: BlsFrC[][] = CHUNK_ROOTS;
+
     console.log('Compiling...');
     console.time('compile');
     const { verificationKey } = await BlobEvalProgram.compile({ cache });
@@ -404,7 +424,7 @@ async function main() {
 
     console.log('Proving...');
     console.time('prove-total');
-    const proof = await proveTree(blobChunks, z, C);
+    const proof = await proveTree(blobChunks, chunkRoots, z, C);
     console.timeEnd('prove-total');
     console.log();
 
