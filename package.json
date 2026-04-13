@@ -18,6 +18,7 @@
     "buildw": "tsc --watch",
     "bench": "npx ts-node src/BenchHash.ts",
     "kzg": "npx ts-node src/KZG.ts",
+    "blob": "npx ts-node src/Blob.ts",
     "coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
     "format": "prettier --write --ignore-unknown **/*",
     "test": "npm run build && node --test \"build/src/**/*.test.js\"",
@@ -44,6 +45,7 @@
     "node": ">=18.14.0"
   },
   "dependencies": {
-    "@o1js/native": "^0.0.1-dev.be63f"
+    "@o1js/native": "^0.0.1-dev.be63f",
+    "c-kzg": "^4.1.0"
   }
 }
