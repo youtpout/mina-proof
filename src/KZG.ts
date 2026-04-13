@@ -7,8 +7,11 @@ import {
     createForeignField,
     verify,
     Cache,
+    setBackend,
 } from 'o1js';
 import { randomBytes } from 'node:crypto';
+
+setBackend('native');
 
 // -----------------------------------------------------------------------------
 // Constants
