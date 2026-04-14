@@ -16,7 +16,9 @@
   "scripts": {
     "build": "tsc",
     "buildw": "tsc --watch",
+    "benchmark": "npx ts-node src/benchmark.ts",
     "bench": "npx ts-node src/BenchHash.ts",
+    "blob1": "npx ts-node src/BlobMethod1.ts",
     "kzg": "npx ts-node src/KZG.ts",
     "blob": "npx ts-node src/Blob.ts",
     "coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",

@@ -7,6 +7,7 @@ import {
     createForeignField,
     verify,
     Cache,
+    setBackend,
 } from 'o1js';
 
 import cKzg from 'c-kzg';
@@ -30,6 +31,8 @@ const {
     verifyBlobKzgProofBatch,
     loadTrustedSetup,
 } = cKzg;
+
+setBackend('native');
 
 // -----------------------------------------------------------------------------
 // Constants
