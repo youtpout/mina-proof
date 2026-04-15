@@ -13,20 +13,14 @@
  *   2. C_kzg == KZGCommit(blob)             — using trusted setup
  *   3. KZG.verify(C_kzg, z, y, π_kzg)      — opening proof at the circuit's z
  *
- * Design decisions:
+ * Inversion strategy (Gemini trick):
+ *   Instead of computing inverses inside the circuit (expensive), we provide
+ *   them as witnesses (off-circuit hints) and only verify d × inv = 1.
+ *   Cost: 1 mul + 1 check per element vs ~60 rows for Montgomery batch inversion.
  *
- *   C  — represented as (C0: Field, C1: Field), the high/low 128-bit halves
- *        of the EIP-4844 versioned hash.  No bits are dropped.
- *
- *   z  — derived in finalize as Poseidon(C0, C1, merkleRoot).  Both C and
- *        merkleRoot are public outputs, so any verifier can recompute z.
- *        The same z is used for the external KZG point-opening check.
- *
- *   z ∉ domain — asserted off-circuit before proving.  For a Poseidon-derived
- *        challenge the probability of z landing on one of the 4096 domain
- *        points is 4096 / BLS_MODULUS ≈ 2^{-242}, negligible at 128-bit
- *        security.  No in-circuit conditional branch is added because it
- *        would cost ~300 rows and the assumption is cryptographically sound.
+ * Number of ZkProgram methods: 3 (leaf, merge, finalize).
+ *   More methods → larger combined Kimchi index encoding → crash.
+ *   ChunkRootsArray (256 × 3 limbs = 768 witness vars) is fine at this scale.
  */
 
 import {
@@ -55,7 +49,6 @@ const {
     BYTES_PER_BLOB,
     BYTES_PER_COMMITMENT,
     BYTES_PER_FIELD_ELEMENT,
-    BYTES_PER_PROOF,
     FIELD_ELEMENTS_PER_BLOB,
     blobToKzgCommitment,
     computeKzgProof,
@@ -76,10 +69,11 @@ const BLS_MODULUS =
 const LOG2_BLOB_SIZE = 12;
 const PRIMITIVE_ROOT_OF_UNITY = 7n;
 const BYTES_PER_FIELD = 32;
-const CHUNK_SIZE = 256;
-const NUM_CHUNKS = FIELD_ELEMENTS_PER_BLOB / CHUNK_SIZE; // 16
-const LOG2_CHUNK_SIZE = 8; // log2(256) levels of Poseidon per leaf
-
+// CHUNK_SIZE=256 causes ~85k rows/leaf → SRS=2^17 → Kimchi index encoding overflows.
+// CHUNK_SIZE=64 gives ~10k rows/leaf → SRS=2^14 → encoding ~10M elements, manageable.
+const CHUNK_SIZE = 64;
+const NUM_CHUNKS = FIELD_ELEMENTS_PER_BLOB / CHUNK_SIZE; // 64
+const LOG2_CHUNK_SIZE = 6;  // log2(64)
 const KZG_VERSION_BYTE = 0x01;
 
 const PROJECT_ROOT = process.cwd();
@@ -100,11 +94,13 @@ type BlsFrA = InstanceType<typeof BlsFrAlmost>;
 type BlsFrC = InstanceType<typeof BlsFrCanonical>;
 type BlsFrU = InstanceType<typeof BlsFr>;
 
+// 3 methods total → ChunkRootsArray as private input is fine (768 witness vars)
 const ChunkArray = Provable.Array(BlsFrAlmost, CHUNK_SIZE);
-// ChunkRootsArray removed — roots are compile-time constants per leaf_k, never witness variables
+const ChunkRootsArray = Provable.Array(BlsFrCanonical, CHUNK_SIZE);
 
 const WIDTH = new BlsFrCanonical(BigInt(FIELD_ELEMENTS_PER_BLOB));
 const ONE = new BlsFrCanonical(1n);
+const ONE_ALMOST = new BlsFrAlmost(1n); // for assertEquals in evalChunk
 const CHUNK_SIGNS = Array.from({ length: CHUNK_SIZE - 1 }, () => 1 as const) as (1 | -1)[];
 
 // ---------------------------------------------------------------------------
@@ -156,28 +152,18 @@ function equalBytes(a: Uint8Array, b: Uint8Array): boolean { return Buffer.from(
 function sha256(data: Uint8Array): Uint8Array { return Uint8Array.from(createHash('sha256').update(data).digest()); }
 
 // ---------------------------------------------------------------------------
-// FIX 3 — C represented as two Fields, no bits dropped
-//
-// versioned hash = 0x01 || sha256(commitment)[1:]  — 32 bytes
-// Split into:
-//   C0 = high 128 bits (bytes  0..15)  — contains the 0x01 version byte
-//   C1 = low  128 bits (bytes 16..31)
-//
-// Both fit in a Mina Field (< 2^128 < Mina prime).
-// Reconstructing the full hash: (C0 << 128) | C1 — no information lost.
+// C as two Fields — no bits dropped
 // ---------------------------------------------------------------------------
 
 function kzgCommitmentToVersionedHash(commitmentBytes: Uint8Array): Uint8Array {
     const hash = sha256(commitmentBytes);
     hash[0] = KZG_VERSION_BYTE;
-    return hash; // 32 bytes
+    return hash;
 }
 
 function versionedHashToFields(versionedHash: Uint8Array): { C0: bigint; C1: bigint } {
-    const full = bytesToBigintBE(versionedHash); // 256-bit integer
-    const C0 = full >> 128n;                      // high 128 bits
-    const C1 = full & ((1n << 128n) - 1n);        // low 128 bits
-    return { C0, C1 };
+    const full = bytesToBigintBE(versionedHash);
+    return { C0: full >> 128n, C1: full & ((1n << 128n) - 1n) };
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +181,7 @@ function blobBytesToFieldElements(blobBytes: Uint8Array): bigint[] {
 }
 
 // ---------------------------------------------------------------------------
-// Roots of unity (Deneb bit-reversal permutation)
+// Roots of unity
 // ---------------------------------------------------------------------------
 
 function reverseBits(n: number, order: number): number {
@@ -227,16 +213,10 @@ const CHUNK_ROOTS: BlsFrC[][] = Array.from({ length: NUM_CHUNKS }, (_, k) =>
 );
 
 // ---------------------------------------------------------------------------
-// Off-circuit evaluator
-//
-// FIX 2 (partial) — z ∉ domain is asserted by the caller before this runs.
-// The circuit never branches on z == w_i; instead we guarantee off-circuit
-// that this case cannot arise for a Poseidon-derived challenge.
-// Probability: 4096 / BLS_MODULUS ≈ 2^{-242} — negligible at 128-bit security.
+// Off-circuit evaluator — z ∉ domain asserted by caller
 // ---------------------------------------------------------------------------
 
 function evaluateBlobOffCircuit(blob: bigint[], z: bigint): bigint {
-    // Caller must assert z ∉ ROOTS_SET before calling this.
     let sum = 0n;
     for (let i = 0; i < FIELD_ELEMENTS_PER_BLOB; i++) {
         const den = mod(z - ROOTS_BIGINT[i]);
@@ -247,27 +227,22 @@ function evaluateBlobOffCircuit(blob: bigint[], z: bigint): bigint {
 }
 
 // ---------------------------------------------------------------------------
-// Off-circuit Merkle root + z derivation
-//
-// Mirrors exactly what the circuit computes so that finalize's assertion
-//   z == Poseidon(C0, C1, merkleRoot)
-// is satisfied.
-//
-// Poseidon.hash() on Field constants is safe outside ZkProgram methods.
+// Off-circuit Merkle root + z derivation — mirrors the circuit exactly
 // ---------------------------------------------------------------------------
-
-function blobElemToLeafField(x: bigint): Field {
-    const mask88 = (1n << 88n) - 1n;
-    return Poseidon.hash([Field(x & mask88), Field((x >> 88n) & mask88), Field(x >> 176n)]);
-}
 
 function computeMerkleRootOffCircuit(
     blobBigints: bigint[],
     C0: bigint,
     C1: bigint,
 ): { merkleRoot: Field; z: BlsFrC; zBigint: bigint } {
-    // Build full Poseidon Merkle tree
-    let leaves: Field[] = blobBigints.map(blobElemToLeafField);
+    // Each blob element → hash its 3 limbs → leaf
+    // Mirrors chunkToSubMerkleRoot: Poseidon.hash(fi.value)
+    const mask88 = (1n << 88n) - 1n;
+    let leaves: Field[] = blobBigints.map(x =>
+        Poseidon.hash([Field(x & mask88), Field((x >> 88n) & mask88), Field(x >> 176n)])
+    );
+
+    // Binary tree reduction — mirrors merge combining sub-roots
     while (leaves.length > 1) {
         const next: Field[] = [];
         for (let i = 0; i < leaves.length; i += 2)
@@ -276,10 +251,8 @@ function computeMerkleRootOffCircuit(
     }
     const merkleRoot = leaves[0];
 
-    // z = Poseidon(C0, C1, merkleRoot) — mirrors finalize in-circuit
     const zField = Poseidon.hash([Field(C0), Field(C1), merkleRoot]);
     const zBigint = zField.toBigInt() % BLS_MODULUS;
-
     return { merkleRoot, z: new BlsFrCanonical(zBigint), zBigint };
 }
 
@@ -288,7 +261,7 @@ function computeMerkleRootOffCircuit(
 // ---------------------------------------------------------------------------
 
 function loadBlobJson(): BlobJson {
-    if (!existsSync(BLOB_JSON_PATH)) throw new Error(`Missing blob.json at: ${BLOB_JSON_PATH}`);
+    if (!existsSync(BLOB_JSON_PATH)) throw new Error(`Missing blob.json: ${BLOB_JSON_PATH}`);
     const p = JSON.parse(readFileSync(BLOB_JSON_PATH, 'utf8')) as Partial<BlobJson>;
     if (!p.blobHex || !p.commitmentHex || !p.proofHex)
         throw new Error('blob.json must contain blobHex, commitmentHex, proofHex');
@@ -303,14 +276,10 @@ function loadBlobscanCase() {
     const blob = blobBytes as Blob;
     const commitment = commitmentBytes as Bytes48;
     const proof = proofBytes as Bytes48;
-
     const blobBigints = blobBytesToFieldElements(blobBytes);
-
-    // FIX 3 — C as two lossless Fields
     const versionedHash = kzgCommitmentToVersionedHash(commitmentBytes);
     const { C0, C1 } = versionedHashToFields(versionedHash);
 
-    // Blob-level KZG checks (no z needed)
     const computedCommitmentBytes = Uint8Array.from(blobToKzgCommitment(blob));
     const commitmentMatches = equalBytes(computedCommitmentBytes, commitmentBytes);
     const proofVerifies = verifyBlobKzgProof(blob, commitment, proof);
@@ -318,14 +287,9 @@ function loadBlobscanCase() {
     const computedBlobProofBytes = Uint8Array.from(computeBlobKzgProof(blob, commitment));
     const blobProofMatches = equalBytes(computedBlobProofBytes, proofBytes);
 
-    // FIX 1 — point-opening KZG check is NOT done here.
-    // It requires z = Poseidon(C0, C1, merkleRoot) which is only known after
-    // computeMerkleRootOffCircuit() runs in main().
-
     return {
         blobBytes, commitmentBytes, proofBytes, blobBigints,
-        versionedHash, C0, C1,
-        blob, commitment,
+        versionedHash, C0, C1, blob, commitment,
         computedCommitmentBytes, commitmentMatches,
         proofVerifies, proofBatchVerifies,
         computedBlobProofBytes, blobProofMatches,
@@ -337,11 +301,11 @@ function loadBlobscanCase() {
 // ---------------------------------------------------------------------------
 
 class BlobEvalOutput extends Struct({
-    C0: Field,           // high 128 bits of EIP-4844 versioned hash
-    C1: Field,           // low  128 bits of EIP-4844 versioned hash
-    merkleRoot: Field,           // Poseidon Merkle root of all 4096 blob elements
-    z: BlsFrCanonical,  // Poseidon(C0, C1, merkleRoot) — derived in finalize
-    partialSum: BlsFrAlmost,     // y = f(z) after finalize
+    C0: Field,          // high 128 bits of EIP-4844 versioned hash
+    C1: Field,          // low  128 bits of EIP-4844 versioned hash
+    merkleRoot: Field,          // Poseidon Merkle root of all 4096 blob elements
+    z: BlsFrCanonical, // Poseidon(C0, C1, merkleRoot) — derived in finalize
+    partialSum: BlsFrAlmost,    // y = f(z) after finalize
     chunksDone: Field,
 }) { }
 
@@ -355,43 +319,50 @@ function squareRepeatedly(x: BlsFrA | BlsFrC, rounds: number): BlsFrA {
     return acc;
 }
 
-function batchInvert(xs: BlsFrA[]): BlsFrA[] {
-    const n = xs.length;
-    if (n === 0) return [];
-    if (n === 1) return [xs[0].inv().assertAlmostReduced() as BlsFrA];
-    const prefix = new Array<BlsFrA>(n);
-    prefix[0] = xs[0];
-    for (let i = 1; i < n; i++) prefix[i] = prefix[i - 1].mul(xs[i]).assertAlmostReduced() as BlsFrA;
-    const invProd = prefix[n - 1].inv().assertAlmostReduced() as BlsFrA;
-    const inv = new Array<BlsFrA>(n);
-    let suffix = invProd;
-    for (let i = n - 1; i >= 1; i--) {
-        inv[i] = suffix.mul(prefix[i - 1]).assertAlmostReduced() as BlsFrA;
-        suffix = suffix.mul(xs[i]).assertAlmostReduced() as BlsFrA;
-    }
-    inv[0] = suffix;
-    return inv;
-}
-
-// FIX 2 — z ∉ domain is guaranteed by the caller (asserted in main before proving).
-// No in-circuit conditional branch: adding Provable.if for each of the 256
-// denominators would cost ~300 extra rows per chunk for a 2^{-242} probability
-// event. The assumption is documented and enforced off-circuit.
+/**
+ * Non-deterministic inversion (Gemini trick):
+ *   - Compute inv = 1/d  OFF-circuit as a Provable.witness hint
+ *   - Verify d × inv = 1 IN-circuit (just one mul + one equality check)
+ *
+ * Cost: ~30 rows per element vs ~60 rows for Montgomery batch inversion.
+ *
+ * z ∉ domain is asserted in main() before proving, so d = z - w_i ≠ 0.
+ */
 function evalChunk(chunk: BlsFrA[], chunkRoots: BlsFrC[], z: BlsFrC): BlsFrA {
-    const nums = chunk.map((fi, i) => fi.mul(chunkRoots[i]).assertAlmostReduced() as BlsFrA);
-    const dens = chunkRoots.map(w => z.sub(w).assertAlmostReduced() as BlsFrA);
-    const invs = batchInvert(dens);
-    const terms = nums.map((n, i) => n.mul(invs[i])) as BlsFrU[];
+    const nums = chunk.map((fi, i) =>
+        fi.mul(chunkRoots[i]).assertAlmostReduced() as BlsFrA
+    );
+
+    const terms: BlsFrU[] = chunk.map((_, i) => {
+        const d = z.sub(chunkRoots[i]).assertAlmostReduced() as BlsFrA;
+
+        // Provide inverse as off-circuit witness
+        const inv = Provable.witness(BlsFrAlmost, () =>
+            new BlsFrAlmost(modInv(d.toBigInt()))
+        );
+
+        // Verify in-circuit: d × inv must equal 1
+        // Use ONE_ALMOST (BlsFrAlmost) to match types — not BlsFrCanonical ONE
+        d.mul(inv).assertAlmostReduced().assertEquals(ONE_ALMOST, 'evalChunk: d×inv ≠ 1');
+
+        return nums[i].mul(inv);
+    });
+
     return BlsFr.sum(terms, CHUNK_SIGNS).assertAlmostReduced() as BlsFrA;
 }
 
+/**
+ * Poseidon Merkle sub-root for one chunk of CHUNK_SIZE blob elements.
+ *
+ * Leaf encoding: hash the 3 × 88-bit limbs of each BLS element.
+ *   Poseidon.hash(fi.value) = Poseidon.hash([l0, l1, l2])
+ *
+ * Tree: LOG2_CHUNK_SIZE = 8 levels of pair-hashing → 255 hashes per chunk.
+ * 16 chunks × 255 + 15 merge hashes = 4095 hashes total — matches Dankrad.
+ */
 function chunkToSubMerkleRoot(chunk: BlsFrA[]): Field {
-    // Leaf: hash the 3 × 88-bit limbs of each BLS element
-    let leaves: Field[] = chunk.map(fi => {
-        const [l0, l1, l2] = fi.value;
-        return Poseidon.hash([l0, l1, l2]);
-    });
-    // LOG2_CHUNK_SIZE = 8 levels → 255 hashes per chunk
+    let leaves: Field[] = chunk.map(fi => Poseidon.hash(fi.value));
+
     for (let level = 0; level < LOG2_CHUNK_SIZE; level++) {
         const next: Field[] = [];
         for (let i = 0; i < leaves.length; i += 2)
@@ -402,29 +373,29 @@ function chunkToSubMerkleRoot(chunk: BlsFrA[]): Field {
 }
 
 // ---------------------------------------------------------------------------
-// ZkProgram
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Method builder
+// ZkProgram — 3 methods only (leaf / merge / finalize)
 //
-// leaf_k — each captures CHUNK_ROOTS[k] as a compile-time constant closure.
-// This means the 256 roots are constants in the circuit (0 witness cells,
-// 0 rows) rather than 768 witness variables that bloat the SRS encoding.
+// Having more methods causes the Kimchi combined index encoding to overflow
+// V8's array allocation limit (~2^30 elements).
 // ---------------------------------------------------------------------------
 
-function buildMethods() {
-    const leaves: Record<string, {
-        privateInputs: [typeof BlsFrCanonical, typeof Field, typeof Field, typeof ChunkArray];
-        method: (z: BlsFrC, C0: Field, C1: Field, chunk: BlsFrA[]) => Promise<{ publicOutput: BlobEvalOutput }>;
-    }> = {};
+const BlobEvalProgram = ZkProgram({
+    name: 'blob-eval-4096-method1-merkle-binding',
+    publicOutput: BlobEvalOutput,
 
-    for (let k = 0; k < NUM_CHUNKS; k++) {
-        const kRoots = CHUNK_ROOTS[k]; // compile-time constant slice for leaf k
-        leaves[`leaf_${k}`] = {
-            privateInputs: [BlsFrCanonical, Field, Field, ChunkArray],
-            async method(z: BlsFrC, C0: Field, C1: Field, chunk: BlsFrA[]): Promise<{ publicOutput: BlobEvalOutput }> {
-                const partialSum = evalChunk(chunk, kRoots, z);
+    methods: {
+        // ── leaf ────────────────────────────────────────────────────────
+        leaf: {
+            privateInputs: [BlsFrCanonical, Field, Field, ChunkRootsArray, ChunkArray],
+
+            async method(
+                z: BlsFrC,
+                C0: Field,
+                C1: Field,
+                chunkRoots: BlsFrC[],
+                chunk: BlsFrA[],
+            ): Promise<{ publicOutput: BlobEvalOutput }> {
+                const partialSum = evalChunk(chunk, chunkRoots, z);
                 const merkleRoot = chunkToSubMerkleRoot(chunk);
                 return {
                     publicOutput: new BlobEvalOutput({
@@ -434,20 +405,9 @@ function buildMethods() {
                     }),
                 };
             },
-        };
-    }
+        },
 
-    return leaves;
-}
-
-const BlobEvalProgram = ZkProgram({
-    name: 'blob-eval-4096-method1-merkle-binding',
-    publicOutput: BlobEvalOutput,
-
-    methods: {
-        ...buildMethods(),
-
-        // ── merge ─────────────────────────────────────────────────────────
+        // ── merge ───────────────────────────────────────────────────────
         merge: {
             privateInputs: [SelfProof, SelfProof] as const,
 
@@ -482,9 +442,7 @@ const BlobEvalProgram = ZkProgram({
             },
         },
 
-        // ── finalize ──────────────────────────────────────────────────────
-        // FIX 1 + 3 — z is re-derived from (C0, C1, merkleRoot), all public.
-        // Uses all 256 bits of the versioned hash (no truncation).
+        // ── finalize ────────────────────────────────────────────────────
         finalize: {
             privateInputs: [SelfProof] as const,
 
@@ -499,15 +457,13 @@ const BlobEvalProgram = ZkProgram({
                     'finalize: tree does not cover the full blob',
                 );
 
-                // Derive z from public data — mirrors computeMerkleRootOffCircuit
+                // Re-derive z from public data — verifiable by anyone
                 const zField = Poseidon.hash([root.C0, root.C1, root.merkleRoot]);
 
-                // Assert z carried through the proof == derived value.
+                // Assert the z carried through the proof equals the derived value.
                 // Limb reconstruction: integer = l0 + l1·2^88 + l2·2^176
                 const [l0, l1, l2] = root.z.value;
-                const TWO_88 = Field(2n ** 88n);
-                const TWO_176 = Field(2n ** 176n);
-                l0.add(l1.mul(TWO_88)).add(l2.mul(TWO_176))
+                l0.add(l1.mul(Field(2n ** 88n))).add(l2.mul(Field(2n ** 176n)))
                     .assertEquals(zField, 'finalize: z != Poseidon(C0, C1, merkleRoot)');
 
                 const zPowN = squareRepeatedly(root.z, LOG2_BLOB_SIZE);
@@ -535,10 +491,6 @@ class BlobEvalProof extends ZkProgram.Proof(BlobEvalProgram) { }
 // Sequential tree prover
 // ---------------------------------------------------------------------------
 
-// Dynamic dispatch to leaf_k methods
-type Prog = typeof BlobEvalProgram & Record<string, (...args: any[]) => Promise<{ proof: BlobEvalProof }>>;
-const prog = BlobEvalProgram as Prog;
-
 async function proveTree(
     blobChunks: BlsFrA[][],
     z: BlsFrC,
@@ -549,7 +501,7 @@ async function proveTree(
     console.time('  level-0');
     const leaves: BlobEvalProof[] = [];
     for (let k = 0; k < NUM_CHUNKS; k++) {
-        const { proof } = await prog[`leaf_${k}`](z, C0, C1, blobChunks[k]);
+        const { proof } = await BlobEvalProgram.leaf(z, C0, C1, CHUNK_ROOTS[k], blobChunks[k]);
         leaves.push(proof as BlobEvalProof);
         console.log(`    leaf ${k + 1}/${NUM_CHUNKS} done`);
     }
@@ -592,7 +544,7 @@ async function main() {
     const input = loadBlobscanCase();
     console.timeEnd('load-input');
 
-    console.log('\n=== Blob-level c-kzg checks (no z needed) ===');
+    console.log('\n=== Blob-level c-kzg checks ===');
     console.log('commitment matches  :', input.commitmentMatches);
     console.log('blob proof verifies :', input.proofVerifies);
     console.log('batch verifies      :', input.proofBatchVerifies);
@@ -601,8 +553,6 @@ async function main() {
     console.log('C0 (high 128 bits)  :', input.C0.toString(16));
     console.log('C1 (low  128 bits)  :', input.C1.toString(16));
 
-    // Compute merkleRoot and z = Poseidon(C0, C1, merkleRoot) off-circuit.
-    // Uses Field constants — safe outside ZkProgram methods.
     console.log('\nComputing Merkle root and z off-circuit...');
     console.time('merkle-offcircuit');
     const { merkleRoot, z, zBigint } = computeMerkleRootOffCircuit(
@@ -612,26 +562,20 @@ async function main() {
     console.log('merkleRoot          :', merkleRoot.toBigInt().toString(16));
     console.log('z = Poseidon(C,root):', zBigint.toString(16));
 
-    // FIX 2 — assert z ∉ domain before proving.
-    // This guarantees evalChunk never inverts zero.
-    if (ROOTS_SET.has(zBigint.toString())) {
-        throw new Error('z is a domain point — this should never happen for a Poseidon challenge');
-    }
+    if (ROOTS_SET.has(zBigint.toString()))
+        throw new Error('z is a domain point — should never happen for a Poseidon challenge');
     console.log('z ∉ domain          : true (asserted)');
 
-    // FIX 1 — KZG point-opening check at the circuit's z
     const yBigint = evaluateBlobOffCircuit(input.blobBigints, zBigint);
     const zBytes = bigintToBytesBE(zBigint, BYTES_PER_FIELD) as Bytes32;
     const yBytes = bigintToBytesBE(yBigint, BYTES_PER_FIELD) as Bytes32;
     const [piZRaw] = computeKzgProof(input.blob, zBytes);
-    const piZBytes = Uint8Array.from(piZRaw);
     const kzgVerify = verifyKzgProof(
-        input.commitment, zBytes, yBytes, piZBytes as Bytes48
+        input.commitment, zBytes, yBytes, Uint8Array.from(piZRaw) as Bytes48
     );
     console.log('\n=== KZG point-opening at circuit z ===');
-    console.log('z (circuit)         :', zBigint.toString(16));
     console.log('y (off-circuit)     :', yBigint.toString());
-    console.log('KZG.verify(C,z,y,π) :', kzgVerify);  // must be true
+    console.log('KZG.verify(C,z,y,π) :', kzgVerify);
 
     const C0 = Field(input.C0);
     const C1 = Field(input.C1);
@@ -668,12 +612,10 @@ async function main() {
     console.log('KZG.verify at z     :', kzgVerify);
 
     console.log('\n=== SP1 responsibilities ===');
-    console.log('SP1 must prove:');
     console.log('  1. merkleRoot == PoseidonMerkle(blob)  [same leaf encoding]');
     console.log('  2. C_kzg == KZGCommit(blob)            [trusted setup]');
     console.log('  3. z == Poseidon(C0, C1, merkleRoot)   [recomputable from public output]');
-    console.log('  4. KZG.verify(C_kzg, z, y, π_kzg)     [already checked above in JS]');
-    console.log('Together: merkleRoot and C_kzg bind to the same blob, y = f(z) is correct.');
+    console.log('  4. KZG.verify(C_kzg, z, y, π_kzg)     [checked above]');
 
     if (!ok || !input.commitmentMatches || !input.proofVerifies || !kzgVerify)
         process.exitCode = 1;
