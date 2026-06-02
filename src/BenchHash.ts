@@ -39,9 +39,12 @@ import {
     createForeignCurve,
     createEcdsa,
     Cache,
+    setBackend,
 } from "o1js";
 
 const INPUT_SIZE = 3;
+
+setBackend('native');
 
 // ---------------------------------------------------------------------------
 // Bytes types — sizes must be known at compile time outside ZkPrograms
@@ -426,7 +429,7 @@ async function runEthereumEcdsaBench(
     console.log(`  Rows (step) : ${rowsStep.toLocaleString()}`);
 
     const t0 = performance.now();
-    await EcdsaEthereumProgram.compile({ cache: Cache.None });
+    await EcdsaEthereumProgram.compile();
     const compileMs = Math.round(performance.now() - t0);
     console.log(`  Compile     : ${compileMs} ms`);
 
