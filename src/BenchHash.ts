@@ -6,6 +6,7 @@
  *   2. SHA2-256   — Hash.SHA2_256
  *   3. Keccak256  — Hash.Keccak256
  *   4. Blake2b    — Hash.BLAKE2B
+ *   5. ECDSA      — Ethereum EIP-191 signature verification on secp256k1
  *
  * Each program has two methods:
  *   base(elem)            → hash(elem)               produces first proof
@@ -34,6 +35,10 @@ import {
     Bytes,
     UInt8,
     Bool,
+    Crypto,
+    createForeignCurve,
+    createEcdsa,
+    Cache,
 } from "o1js";
 
 const INPUT_SIZE = 3;
@@ -44,6 +49,12 @@ const INPUT_SIZE = 3;
 
 class Bytes31 extends Bytes(31) { }  // one field element encoded
 class Bytes62 extends Bytes(62) { }  // previous digest (31) + next element (31)
+class Bytes32 extends Bytes(32) { }  // Ethereum signed message payload
+class Bytes60 extends Bytes(60) { }  // EIP-191 prefix (26) + "32" + message (32)
+
+class Secp256k1 extends createForeignCurve(Crypto.CurveParams.Secp256k1) { }
+class Secp256k1Scalar extends Secp256k1.Scalar { }
+class Ecdsa extends createEcdsa(Secp256k1) { }
 
 // ---------------------------------------------------------------------------
 // In-circuit helpers
@@ -223,6 +234,48 @@ const Blake2bProgram = ZkProgram({
 });
 
 // ---------------------------------------------------------------------------
+// 5. ECDSA Ethereum — secp256k1 + EIP-191 ("personal_sign" / ethers signMessage)
+// ---------------------------------------------------------------------------
+
+const EcdsaEthereumProgram = ZkProgram({
+    name: "EcdsaEthereumBench",
+    publicOutput: Bool,
+
+    methods: {
+        base: {
+            privateInputs: [Bytes32, Ecdsa, Secp256k1],
+            async method(
+                message: Bytes32,
+                signature: Ecdsa,
+                publicKey: Secp256k1
+            ): Promise<{ publicOutput: Bool }> {
+                const isValid = signature.verifyEthers(message, publicKey);
+                isValid.assertTrue("Ethereum ECDSA signature must verify");
+                return { publicOutput: isValid };
+            },
+        },
+
+        step: {
+            privateInputs: [SelfProof<undefined, Bool>, Bytes32, Ecdsa, Secp256k1],
+            async method(
+                prevProof: SelfProof<undefined, Bool>,
+                message: Bytes32,
+                signature: Ecdsa,
+                publicKey: Secp256k1
+            ): Promise<{ publicOutput: Bool }> {
+                prevProof.verify();
+                prevProof.publicOutput.assertTrue("previous Ethereum ECDSA proof must verify");
+
+                const isValid = signature.verifyEthers(message, publicKey);
+                const merged = prevProof.publicOutput.and(isValid);
+                merged.assertTrue("merged Ethereum ECDSA signatures must verify");
+                return { publicOutput: merged };
+            },
+        },
+    },
+});
+
+// ---------------------------------------------------------------------------
 // Recursive fold — runs outside the circuit
 //
 //   proof = base(inputs[0])
@@ -258,6 +311,12 @@ interface BenchResult {
     verifyMs: number;
     totalMs: number;
 }
+
+type EthereumSignatureTrial = {
+    message: Bytes32;
+    signature: Ecdsa;
+    publicKey: Secp256k1;
+};
 
 function separator(title: string) {
     console.log("\n" + "─".repeat(64));
@@ -304,6 +363,90 @@ async function runBench<P extends {
     return { name, rowsBase, rowsStep, compileMs, proveMs, verifyMs, totalMs };
 }
 
+function ethereumPersonalMessageHash(message: Bytes32): Bytes {
+    const prefix = Bytes.fromString("\x19Ethereum Signed Message:\n");
+    const length = Bytes.fromString(String(message.length));
+
+    return Hash.Keccak256.hash(
+        Bytes60.from([
+            ...prefix.bytes,
+            ...length.bytes,
+            ...message.bytes,
+        ])
+    );
+}
+
+function createEthereumSignatureTrials(count: number): EthereumSignatureTrial[] {
+    return Array.from({ length: count }, (_, i) => {
+        const privateKey = Secp256k1Scalar.random();
+        const publicKey = Secp256k1.generator.scale(privateKey);
+        const message = Bytes32.fromString(
+            `eth ecdsa wallet benchmark #${String(i + 1).padStart(4, "0")}`
+        );
+        const signature = Ecdsa.signHash(
+            ethereumPersonalMessageHash(message),
+            privateKey.toBigInt()
+        );
+
+        return { message, signature, publicKey };
+    });
+}
+
+async function recursiveEthereumEcdsaFold(
+    trials: EthereumSignatureTrial[]
+): Promise<SelfProof<undefined, Bool>> {
+    let { proof } = await EcdsaEthereumProgram.base(
+        trials[0].message,
+        trials[0].signature,
+        trials[0].publicKey
+    );
+
+    for (let i = 1; i < trials.length; i++) {
+        ({ proof } = await EcdsaEthereumProgram.step(
+            proof,
+            trials[i].message,
+            trials[i].signature,
+            trials[i].publicKey
+        ));
+    }
+
+    return proof;
+}
+
+async function runEthereumEcdsaBench(
+    trials: EthereumSignatureTrial[]
+): Promise<BenchResult> {
+    const name = "ECDSA Ethereum";
+    separator(`Benchmarking: ${name}`);
+
+    const analysis = await EcdsaEthereumProgram.analyzeMethods();
+    const rowsBase = (analysis["base"] as { rows: number }).rows;
+    const rowsStep = (analysis["step"] as { rows: number }).rows;
+    console.log(`  Rows (base) : ${rowsBase.toLocaleString()}`);
+    console.log(`  Rows (step) : ${rowsStep.toLocaleString()}`);
+
+    const t0 = performance.now();
+    await EcdsaEthereumProgram.compile({ cache: Cache.None });
+    const compileMs = Math.round(performance.now() - t0);
+    console.log(`  Compile     : ${compileMs} ms`);
+
+    const t1 = performance.now();
+    const proof = await recursiveEthereumEcdsaFold(trials);
+    const proveMs = Math.round(performance.now() - t1);
+    console.log(`  Prove total : ${proveMs} ms  (${trials.length} recursive signature steps)`);
+    console.log(`  Final valid : ${proof.publicOutput.toString()}`);
+
+    const t2 = performance.now();
+    const ok = await EcdsaEthereumProgram.verify(proof);
+    const verifyMs = Math.round(performance.now() - t2);
+    console.log(`  Verify      : ${verifyMs} ms  (valid=${ok})`);
+
+    const totalMs = compileMs + proveMs + verifyMs;
+    console.log(`  TOTAL       : ${totalMs} ms`);
+
+    return { name, rowsBase, rowsStep, compileMs, proveMs, verifyMs, totalMs };
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -312,7 +455,7 @@ async function main() {
     console.log("\n╔══════════════════════════════════════════════════════════════╗");
     console.log(`║  o1js Recursive Proof Benchmark — ${INPUT_SIZE} inputs               ║`);
     console.log("║  Loop is OUTSIDE the circuit (proof merging pattern)        ║");
-    console.log("║  Poseidon  /  SHA2-256  /  Keccak256  /  Blake2b            ║");
+    console.log("║  Poseidon / SHA2-256 / Keccak256 / Blake2b / ECDSA          ║");
     console.log("╚══════════════════════════════════════════════════════════════╝");
 
     const inputs: Field[] = Array.from({ length: INPUT_SIZE }, (_, i) =>
@@ -321,10 +464,14 @@ async function main() {
 
     const results: BenchResult[] = [];
 
+    results.push(await runEthereumEcdsaBench(
+        createEthereumSignatureTrials(INPUT_SIZE)
+    ));
     results.push(await runBench(PoseidonProgram, inputs, "Poseidon (native)"));
     results.push(await runBench(Sha256Program, inputs, "SHA2-256"));
     results.push(await runBench(Keccak256Program, inputs, "Keccak256"));
     results.push(await runBench(Blake2bProgram, inputs, "Blake2b"));
+
 
     // ── Summary ───────────────────────────────────────────────────────────────
     separator("Summary");
@@ -357,7 +504,8 @@ async function main() {
         );
     }
 
-    console.log(`\n  ${INPUT_SIZE} inputs — 1 base proof + ${INPUT_SIZE - 1} recursive step proof(s)`);
+    console.log(`\n  Hash benches: ${INPUT_SIZE} inputs — 1 base proof + ${INPUT_SIZE - 1} recursive step proof(s)`);
+    console.log(`  ECDSA bench: ${INPUT_SIZE} Ethereum EIP-191 signatures — 1 base proof + ${INPUT_SIZE - 1} recursive step proof(s)`);
     console.log("  Step rows include SelfProof.verify() cost");
     console.log("  Prove ratio relative to Poseidon baseline (1×)\n");
 }
